@@ -1,0 +1,7 @@
+{
+    "yaml.schemas": {
+        "https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/ansible.json#/$defs/playbook": "file:///home/pranav1244/poc3/ansible-playbook/pipeline.yml",
+        "https://raw.githubusercontent.com/ansible/ansible-lint/main/src/ansiblelint/schemas/inventory.json": "file:///home/pranav1244/poc3/ansible-playbook/sonarqube.yml"
+    },
+    "ansible.python.interpreterPath": "/bin/python3"
+}

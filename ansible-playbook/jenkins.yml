@@ -1,26 +1,45 @@
 ---
 - name: Setup Jenkins
-  hosts: all
+  hosts: server
   become: true
   vars:
     jenkins_url: "http://localhost:8080"
+    sonarqube_url: "http://localhost:9000"
     jenkins_container: "jenkins_container"
+    jenkins_host: "localhost"
     username: "pranav"
     new_password: "1234"
     fullname: "pranav"
     email: "pprv.41@gmail.com"
+    job_config_xml_path: "/tmp/job-config.xml"
+    jenkins_crumb_url: "{{ jenkins_url }}/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)"
+    repo_url: "https://github.com/pranav-1244/proof-of-conflict.git"
+    sonar_scanner_dir: "/opt/sonar-scanner"
+    sonarqube_project_key: "my_project"
+
   tasks:
+    - name: Load SonarQube credentials from JSON file
+      set_fact:
+        sonarqube_credentials: "{{ lookup('file', '/home/pranav1244/poc3/sonarqube_credentials.json') | from_json }}"
+
+    - name: Set SonarQube project key and token
+      set_fact:
+        sonar_project_key: "{{ sonarqube_credentials.SONAR_PROJECT_KEY }}"
+        sonar_token: "{{ sonarqube_credentials.SONAR_TOKEN }}"
+        
     - name: Pull Jenkins Docker image
       docker_image:
         name: jenkins/jenkins
         source: pull
+
     - name: Run Jenkins Docker container
       docker_container:
-        name: jenkins_container
+        name: "{{ jenkins_container }}"
         image: jenkins/jenkins
         state: started
         ports:
           - "8080:8080"
+
     - name: Wait until Jenkins is fully up and running
       uri:
         url: "{{ jenkins_url }}/login"
@@ -31,26 +50,33 @@
       until: jenkins_status.status == 200
       retries: 10
       delay: 10
+
     - name: Get initial admin password from Jenkins
       command: sudo docker exec {{ jenkins_container }} cat /var/jenkins_home/secrets/initialAdminPassword
       register: initial_password_output
+
     - name: Check if initial admin password is found
       fail:
         msg: "Initial admin password file not found!"
       when: initial_password_output.stdout == ""
+
     - name: Set password variable
       set_fact:
         password: "{{ initial_password_output.stdout }}"
+
     - name: Create cookie jar
       command: mktemp
       register: cookie_jar
+
     - name: Get Jenkins crumb
       shell: |
         curl -u "admin:{{ password }}" --cookie-jar "{{ cookie_jar.stdout }}" "{{ jenkins_url }}/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)"
       register: full_crumb_output
+
     - name: Extract only crumb
       set_fact:
         only_crumb: "{{ full_crumb_output.stdout.split(':')[1] | trim }}"
+
     - name: Create admin user
       shell: |
         curl -X POST -u "admin:{{ password }}" "{{ jenkins_url }}/setupWizard/createAdminUser" \
@@ -61,6 +87,7 @@
           -H "Content-Type: application/x-www-form-urlencoded" \
           --cookie "{{ cookie_jar.stdout }}" \
           --data-raw "username={{ username }}&password1={{ new_password }}&password2={{ new_password }}&fullname={{ fullname }}&email={{ email }}&Jenkins-Crumb={{ only_crumb }}&json=%7B%22username%22%3A%20%22{{ username }}%22%2C%20%22password1%22%3A%20%22{{ new_password }}%22%2C%20%22password2%22%3A%20%22{{ new_password }}%22%2C%20%22fullname%22%3A%20%22{{ fullname }}%22%2C%20%22email%22%3A%20%22{{ email }}%22%2C%20%22Jenkins-Crumb%22%3A%20%22{{ only_crumb }}%22%7D"
+
     - name: Install plugins
       shell: |
         full_crumb=$(curl -u "{{ username }}:{{ new_password }}" --cookie-jar "{{ cookie_jar.stdout }}" "{{ jenkins_url }}/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)")
@@ -73,6 +100,7 @@
           -H "Content-Type: application/json" \
           --cookie "{{ cookie_jar.stdout }}" \
           --data-raw '{"dynamicLoad":true,"plugins":["cloudbees-folder","antisamy-markup-formatter","build-timeout","credentials-binding","timestamper","ws-cleanup","ant","gradle","workflow-aggregator","github-branch-source","pipeline-github-lib","pipeline-stage-view","git","ssh-slaves","matrix-auth","pam-auth","ldap","email-ext","mailer","sonar"],"Jenkins-Crumb":"'$only_crumb'"}'
+
     - name: Confirm Jenkins URL
       shell: |
         url_urlEncoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('{{ jenkins_url }}', safe=''))")
@@ -84,6 +112,83 @@
           -H "Content-Type: application/x-www-form-urlencoded" \
           --cookie "{{ cookie_jar.stdout }}" \
           --data-raw "rootUrl=$url_urlEncoded%2F&Jenkins-Crumb={{ only_crumb }}&json=%7B%22rootUrl%22%3A%20%22$url_urlEncoded%2F%22%2C%20%22Jenkins-Crumb%22%3A%20%22{{ only_crumb }}%22%7D"
+
     - name: Complete Jenkins setup
       debug:
         msg: "Jenkins setup complete!"
+
+    - name: Install unzip package
+      apt:
+        name: unzip
+        state: present
+      become: yes
+
+    - name: Download SonarQube Scanner
+      get_url:
+        url: https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.8.0.2856-linux.zip
+        dest: /tmp/sonar-scanner.zip
+
+    - name: Unzip SonarQube Scanner
+      unarchive:
+        src: /tmp/sonar-scanner.zip
+        dest: /opt/
+        remote_src: yes
+
+    - name: Set use_embed_jre
+      lineinfile:
+        path: "/opt/sonar-scanner-4.8.0.2856-linux/bin/sonar-scanner"
+        regexp: 'use_embedded_jre=true'
+        line: 'use_embedded_jre=false'
+
+    - name: Ensure Jenkins user has ownership of the SonarScanner directory
+      command: chown -R ubuntu:ubuntu /opt/sonar-scanner-4.8.0.2856-linux/
+
+    - name: Ensure the SonarScanner binary is executable
+      command: chmod +x /opt/sonar-scanner-4.8.0.2856-linux/bin/sonar-scanner
+
+    - name: Create symlink for SonarQube Scanner
+      file:
+        src: /opt/sonar-scanner-4.8.0.2856-linux/bin/sonar-scanner
+        dest: /usr/local/bin/sonar-scanner
+        state: link
+
+    - name: Ensure .bashrc exists for Ubuntu user
+      lineinfile:
+        path: "/home/ubuntu/.bashrc"
+        create: yes
+        line: ''
+
+    - name: Add SonarScanner to Ubuntu user's PATH
+      lineinfile:
+        path: "/home/ubuntu/.bashrc"
+        line: 'export PATH=$PATH:/opt/sonar-scanner-4.8.0.2856-linux/bin'
+        state: present
+
+    - name: Source the updated .bashrc for Ubuntu user
+      shell: bash -c "source /home/ubuntu/.bashrc"
+      become: yes
+      become_user: ubuntu
+
+    - name: Clean up downloaded zip file
+      file:
+        path: /tmp/sonar-scanner.zip
+        state: absent
+
+    - name: Create Jenkins job configuration XML from template
+      template:
+        src: /home/pranav1244/poc3/ansible-playbook/job-config.xml.j2  # Path to the Jinja2 template file
+        dest: /home/pranav1244/poc3/ansible-playbook/job-config.xml    # Correct destination path where XML is created
+
+    - name: Create a Jenkins job using basic authentication
+      community.general.jenkins_job:
+        config: "{{ lookup('file', '/home/pranav1244/poc3/ansible-playbook/job-config.xml') }}"
+        name: "test"
+        url: "{{ jenkins_url }}"
+        user: "{{ username }}"
+        password: "{{ new_password }}"
+        state: present
+
+    - name: Print Jenkins job creation success message
+      debug:
+        msg: "Jenkins job has been created successfully!"
+

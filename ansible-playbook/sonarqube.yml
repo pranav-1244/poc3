@@ -1,22 +1,21 @@
 ---
 - name: Setup SonarQube using curl
-  hosts: all
+  hosts: server
   become: yes
   vars:
     sonarqube_url: "http://localhost:9000"
-    previous_password: "admin"
-    new_password: "1234"
-    sonarqube_admin: "admin"
+    sonarqube_port: 9000
+    sonarqube_default_password: "admin"
+    sonarqube_new_password: "1234"
+    sonarqube_admin_login: "admin"
     sonarqube_password: "1234"
     sonarqube_project_key: "my_project"
     sonarqube_project_name: "My SonarQube Project"
     sonarqube_token_name: "jenkins_token"
     sonarqube_base_url: "http://localhost:9000"
-    jenkins_url: "http://localhost:8080"
-    jenkins_username: "admin"
-    jenkins_password: "1234"
-    jenkins_credentials_id: "sonarqube_token"
-    
+    quality_gate_name: "Sonar way"  # Name of the quality gate
+    jenkins_credentials_file: "/credentials.txt"  # Path to store Jenkins credentials
+
   tasks:
     - name: Ensure Docker is started
       service:
@@ -27,40 +26,37 @@
       shell: docker ps -q -f name=sonarqube_container
       register: sonarqube_running
       ignore_errors: true
-    
+
     - name: Stop and remove existing SonarQube container if it exists
       shell: |
         docker stop sonarqube_container && docker rm sonarqube_container
       when: sonarqube_running.stdout != ""
-      ignore_errors: true
-    
+
     - name: Pull SonarQube Docker image
       shell: docker pull sonarqube:latest
       register: pull_image_output
-      ignore_errors: true
-    
+
     - name: Debug image pull result
       debug:
         var: pull_image_output.stdout
-    
+
     - name: Run SonarQube Docker container
       shell: docker run -d --name sonarqube_container -p 9000:9000 sonarqube
       register: run_container_output
-      ignore_errors: true
-    
+
     - name: Debug container run result
       debug:
         var: run_container_output.stdout
-    
+
     - name: Wait for SonarQube to be fully operational
       shell: |
         for i in $(seq 1 50); do
-          status=$(curl -s {{ sonarqube_url }}/api/system/status | jq -r '.status')
-          if [ "$status" = "UP" ]; then
+          status=$(curl -s {{ sonarqube_url }}/api/system/status | grep -o '"status":"UP"')
+          if [ "$status" = '"status":"UP"' ]; then
             echo "SonarQube is operational"
             exit 0
           else
-            echo "SonarQube not ready, status: $status, retrying in 15 seconds (attempt $i/50)..."
+            echo "SonarQube not ready, retrying in 15 seconds (attempt $i/50)..."
             sleep 15
           fi
         done
@@ -69,122 +65,79 @@
       retries: 100
       delay: 15
       ignore_errors: yes
-    
+
     - name: Debug the SonarQube status result
       debug:
         var: sonarqube_status
-    
+
     - name: Fail if SonarQube did not fully start
       fail:
         msg: "SonarQube failed to start."
       when: sonarqube_status.rc != 0
+
+    - name: Change admin password
+      ansible.builtin.uri:
+        url: "http://localhost:{{ sonarqube_port }}/api/users/change_password"
+        method: POST
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_default_password }}"
+        force_basic_auth: yes
+        body: "login={{ sonarqube_admin_login }}&previousPassword={{ sonarqube_default_password }}&password={{ sonarqube_new_password }}"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+        status_code: [200, 204]
+      no_log: true
+
+    - name: Create SonarQube project
+      ansible.builtin.uri:
+        url: "http://localhost:{{ sonarqube_port }}/api/projects/create?project={{ sonarqube_project_key }}&name={{ sonarqube_project_name | urlencode }}"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_new_password }}"
+        method: POST
+        force_basic_auth: yes
+      register: project_response  
+
+    - name: Generate user token
+      ansible.builtin.uri:
+        url: "http://localhost:{{ sonarqube_port }}/api/user_tokens/generate"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_new_password }}"
+        method: POST
+        force_basic_auth: yes
+        body: "name={{ sonarqube_token_name }}"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+      register: token_response
     
-    - name: Change SonarQube default admin password using curl
-      shell: |
-        curl -u admin:{{ previous_password }} -X POST "{{ sonarqube_url }}/api/users/change_password" \
-          -d "login=admin&password={{ new_password }}&previousPassword={{ previous_password }}"
-      register: password_change_output
-      ignore_errors: true
-    
-    - name: Debug password change result
+    - name: Set the default quality gate
+      ansible.builtin.uri:
+        url: "http://localhost:{{ sonarqube_port }}/api/qualitygates/set_as_default"
+        user: "{{ sonarqube_admin_login }}"
+        password: "{{ sonarqube_new_password }}"
+        method: POST
+        force_basic_auth: yes
+        body: "name={{ quality_gate_name | urlencode }}"
+        headers:
+          Content-Type: "application/x-www-form-urlencoded"
+      register: quality_gate_response
+      failed_when: quality_gate_response.status not in [200, 204]
+
+    - name: Store SonarQube credentials as a JSON file on the Ansible control machine
+      delegate_to: localhost
+      copy:
+        dest: "/home/pranav1244/poc3/sonarqube_credentials.json"
+        content: |
+          {
+            "SONAR_PROJECT_KEY": "{{ sonarqube_project_key }}",
+            "SONAR_TOKEN": "{{ token_response.json.token }}",
+            
+          }
+        mode: '0644'
+
+    - name: Load SonarQube credentials from JSON file
+      set_fact:
+        sonarqube_credentials: "{{ lookup('file', '/home/pranav1244/poc3/sonarqube_credentials.json') | from_json }}"
+
+    - name: Use the SonarQube project key and token
       debug:
-        var: password_change_output.stdout
-    
-    - name: Test new admin credentials with curl
-      shell: |
-        curl -u admin:{{ new_password }} -X GET "{{ sonarqube_url }}/api/users/search"
-      register: test_login_output
-      ignore_errors: true
-    
-    - name: Debug login test result
-      debug:
-        var: test_login_output.stdout
-    
-    - name: Fail if the new admin credentials did not work
-      fail:
-        msg: "Failed to log in with new admin credentials."
-      when: test_login_output.rc != 0
-
-    # # SonarQube and Jenkins Integration
-    # # Step 1: Create SonarQube Project
-    # - name: Create a SonarQube project
-    #   uri:
-    #     url: "{{ sonarqube_url }}/api/projects/create"
-    #     method: POST
-    #     user: "{{ sonarqube_admin }}"
-    #     password: "{{ sonarqube_password }}"
-    #     body_format: form-urlencoded
-    #     body:
-    #       project: "{{ sonarqube_project_key }}"
-    #       name: "{{ sonarqube_project_name }}"
-    #     status_code: 200
-    #   register: project_creation_result
- 
-    # # Step 2: Set SonarQube global base URL
-    # - name: Set SonarQube global base URL
-    #   uri:
-    #     url: "{{ sonarqube_url }}/api/settings/set"
-    #     method: POST
-    #     user: "{{ sonarqube_admin }}"
-    #     password: "{{ sonarqube_password }}"
-    #     body_format: form-urlencoded
-    #     body:
-    #       key: "sonar.core.serverBaseURL"
-    #       value: "{{ sonarqube_base_url }}"
-    #     status_code: 204
-    #   register: base_url_result
-
-    # # Step 3: Generate SonarQube Token
-    # - name: Generate SonarQube token for Jenkins
-    #   uri:
-    #     url: "{{ sonarqube_url }}/api/user_tokens/generate"
-    #     method: POST
-    #     user: "{{ sonarqube_admin }}"
-    #     password: "{{ sonarqube_password }}"
-    #     body_format: form-urlencoded
-    #     body:
-    #       name: "{{ sonarqube_token_name }}"
-    #     status_code: 200
-    #   register: token_generation_result
-
-    # - name: Extract generated SonarQube token
-    #   set_fact:
-    #     sonarqube_token: "{{ token_generation_result.json.token }}"
-
-    # # Step 4: Add the SonarQube token to Jenkins as a secret text credential
-    # - name: Get Jenkins crumb (CSRF protection token)
-    #   uri:
-    #     url: "{{ jenkins_url }}/crumbIssuer/api/json"
-    #     method: GET
-    #     user: "{{ jenkins_username }}"
-    #     password: "{{ jenkins_password }}"
-    #     status_code: 200
-    #   register: crumb_data
-
-    # - name: Add SonarQube token to Jenkins as secret text credential
-    #   uri:
-    #     url: "{{ jenkins_url }}/credentials/store/system/domain/_/createCredentials"
-    #     method: POST
-    #     user: "{{ jenkins_username }}"
-    #     password: "{{ jenkins_password }}"
-    #     headers:
-    #       Content-Type: "application/x-www-form-urlencoded"
-    #       Jenkins-Crumb: "{{ crumb_data.json.crumb }}"
-    #     body_format: form-urlencoded
-    #     body: |
-    #       json={
-    #         "": "0",
-    #         "credentials": {
-    #           "scope": "GLOBAL",
-    #           "id": "{{ jenkins_credentials_id }}",
-    #           "secret": "{{ sonarqube_token }}",
-    #           "description": "SonarQube token for Jenkins",
-    #           "stapler-class": "org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl",
-    #           "$class": "org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl"
-    #         }
-    #       }
-    #     status_code: 200
-
-    # - name: Confirm Jenkins credential creation
-    #   debug:
-    #     msg: "SonarQube token has been successfully added to Jenkins as a secret text credential."
+        msg: "Project Key: {{ sonarqube_credentials.SONAR_PROJECT_KEY }}, Token: {{ sonarqube_credentials.SONAR_TOKEN }}"
